@@ -260,6 +260,10 @@ interface Task {
     dateTime: string
     timeZone: string
   }
+  startDateTime?: {
+    dateTime: string
+    timeZone: string
+  }
   completedDateTime?: {
     dateTime: string
     timeZone: string
@@ -273,6 +277,24 @@ interface Task {
     contentType: string
   }
   categories?: string[]
+  recurrence?: {
+    pattern: {
+      type: string
+      interval: number
+      month?: number
+      dayOfMonth?: number
+      daysOfWeek?: string[]
+      firstDayOfWeek?: string
+      index?: string
+    }
+    range: {
+      type: string
+      startDate?: string
+      endDate?: string
+      numberOfOccurrences?: number
+      recurrenceTimeZone?: string
+    }
+  }
 }
 
 interface ChecklistItem {
@@ -1570,6 +1592,170 @@ server.tool(
           {
             type: "text",
             text: `Error deleting checklist item: ${error}`,
+          },
+        ],
+      }
+    }
+  },
+)
+
+// Move a task from one list to another.
+//
+// Microsoft Graph does not expose a "move" endpoint for todoTask; the only
+// supported way is to read the source task, recreate it in the target list,
+// then delete the original. Caveats the caller should know:
+//   - The moved task gets a NEW id.
+//   - If it was part of a recurring series, it starts a fresh series in the
+//     new list (the recurrence rule is preserved but the existing series
+//     link in the source list is lost).
+//   - Subtasks (checklistItems) are NOT moved by default — pass
+//     moveChecklistItems=true to recreate them in the target task.
+server.tool(
+  "move-task",
+  "Move a task from one list to another. The task is recreated in the target list (gets a new id) and the original is deleted. Pass `moveChecklistItems=true` to also move subtasks. Sub-resource links (extensions, linkedResources, attachments) are NOT moved.",
+  {
+    sourceListId: z.string().describe("ID of the list the task currently lives in"),
+    taskId: z.string().describe("ID of the task to move"),
+    targetListId: z.string().describe("ID of the list to move the task to"),
+    moveChecklistItems: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("If true, also recreate the task's checklist items in the new task (default: false)"),
+  },
+  async ({ sourceListId, taskId, targetListId, moveChecklistItems }) => {
+    try {
+      if (sourceListId === targetListId) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "sourceListId and targetListId are the same — nothing to move.",
+            },
+          ],
+        }
+      }
+
+      const token = await getAccessToken()
+      if (!token) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Failed to authenticate with Microsoft API",
+            },
+          ],
+        }
+      }
+
+      // 1. Fetch the source task with all the fields we can replicate
+      const sourceTask = await makeGraphRequest<Task>(
+        `${MS_GRAPH_BASE}/me/todo/lists/${sourceListId}/tasks/${taskId}`,
+        token,
+      )
+      if (!sourceTask) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to read source task ${taskId} from list ${sourceListId}`,
+            },
+          ],
+        }
+      }
+
+      // 2. Build the new task body — copy only the fields the Graph create
+      //    endpoint accepts. Status defaults to notStarted in the new copy.
+      const newBody: any = {
+        title: sourceTask.title,
+        importance: sourceTask.importance,
+      }
+      if (sourceTask.body?.content !== undefined) {
+        newBody.body = {
+          content: sourceTask.body.content,
+          contentType: sourceTask.body.contentType || "text",
+        }
+      }
+      if (sourceTask.dueDateTime) {
+        newBody.dueDateTime = {
+          dateTime: sourceTask.dueDateTime.dateTime,
+          timeZone: sourceTask.dueDateTime.timeZone,
+        }
+      }
+      if (sourceTask.startDateTime) {
+        newBody.startDateTime = {
+          dateTime: sourceTask.startDateTime.dateTime,
+          timeZone: sourceTask.startDateTime.timeZone,
+        }
+      }
+      if (sourceTask.recurrence) {
+        newBody.recurrence = sourceTask.recurrence
+      }
+      if (sourceTask.categories && sourceTask.categories.length > 0) {
+        newBody.categories = sourceTask.categories
+      }
+
+      // 3. Create the new task in the target list
+      const created = await makeGraphRequest<Task>(
+        `${MS_GRAPH_BASE}/me/todo/lists/${targetListId}/tasks`,
+        token,
+        "POST",
+        newBody,
+      )
+      if (!created) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Failed to create task in target list ${targetListId}`,
+            },
+          ],
+        }
+      }
+
+      // 4. Optionally move checklist items
+      let movedChecklistCount = 0
+      if (moveChecklistItems) {
+        const items = await makeGraphRequest<{ value: ChecklistItem[] }>(
+          `${MS_GRAPH_BASE}/me/todo/lists/${sourceListId}/tasks/${taskId}/checklistItems`,
+          token,
+        )
+        for (const item of items?.value || []) {
+          await makeGraphRequest(
+            `${MS_GRAPH_BASE}/me/todo/lists/${targetListId}/tasks/${created.id}/checklistItems`,
+            token,
+            "POST",
+            { displayName: item.displayName, isChecked: item.isChecked },
+          )
+          movedChecklistCount++
+        }
+      }
+
+      // 5. Delete the source task (only after the new one is in place)
+      await makeGraphRequest<null>(
+        `${MS_GRAPH_BASE}/me/todo/lists/${sourceListId}/tasks/${taskId}`,
+        token,
+        "DELETE",
+      )
+
+      const checklistInfo = moveChecklistItems
+        ? `\nChecklist items moved: ${movedChecklistCount}`
+        : "\nChecklist items: not moved (pass moveChecklistItems=true to move them)"
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Task moved successfully.\nNew ID: ${created.id}\nNew title: ${created.title}\nMoved from list ${sourceListId} to list ${targetListId}${checklistInfo}`,
+          },
+        ],
+      }
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error moving task: ${error}`,
           },
         ],
       }
